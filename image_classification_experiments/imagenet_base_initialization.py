@@ -40,14 +40,20 @@ def extract_features(model, data_loader, data_len, num_channels=512, spatial_fea
 
 
 def extract_base_init_features(imagenet_path, label_dir, extract_features_from, classifier_ckpt, arch,
-                               max_class, num_channels, spatial_feat_dim, batch_size=128):
+                               max_class, num_channels, spatial_feat_dim, batch_size=128, cgqa=False):
     core_model = build_classifier(arch, classifier_ckpt, num_classes=None)
 
     model = ModelWrapper(core_model, output_layer_names=[extract_features_from], return_single=True)
 
-    base_train_loader = utils_imagenet.get_imagenet_data_loader(imagenet_path + '/train', label_dir, split='train',
-                                                                batch_size=batch_size, shuffle=False, min_class=0,
-                                                                max_class=max_class, return_item_ix=True)
+    if cgqa:
+        from CFST_experiment import get_cgqa_data_loader
+        base_train_loader = get_cgqa_data_loader(imagenet_path, label_dir, 'train', 0, max_class,
+                                                 batch_size=batch_size,
+                                                 return_item_ix=True)
+    else:
+        base_train_loader = utils_imagenet.get_imagenet_data_loader(imagenet_path + '/train', label_dir, split='train',
+                                                                    batch_size=batch_size, shuffle=False, min_class=0,
+                                                                    max_class=max_class, return_item_ix=True)
 
     base_train_features, base_train_labels, base_item_ixs = extract_features(model, base_train_loader,
                                                                              len(base_train_loader.dataset),

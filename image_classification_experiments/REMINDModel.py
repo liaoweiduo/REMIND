@@ -43,15 +43,17 @@ class REMINDModel(object):
                  classifier_F='ResNet18_StartAt_Layer4_1', classifier_ckpt=None, weight_decay=1e-5, lr_mode=None,
                  lr_step_size=100, start_lr=0.1, end_lr=0.001, lr_gamma=0.5, num_samples=50, use_mixup=False,
                  mixup_alpha=0.2, grad_clip=None, num_channels=512, num_feats=7, num_codebooks=32, codebook_size=256,
-                 use_random_resize_crops=True, max_buffer_size=None):
+                 use_random_resize_crops=True, max_buffer_size=None, num_epochs=50):
 
         # make the classifier
-        self.classifier_F = utils.build_classifier(classifier_F, classifier_ckpt, num_classes=num_classes)
-        core_model = utils.build_classifier(classifier_G, classifier_ckpt, num_classes=None)
-        self.classifier_G = ModelWrapper(core_model, output_layer_names=[extract_features_from], return_single=True)
+        self.classifier_F = utils.build_classifier(classifier_F, classifier_ckpt, num_classes=num_classes).cuda()
+        # core_model = utils.build_classifier(classifier_G, classifier_ckpt, num_classes=None).cuda()
+        # self.classifier_G = ModelWrapper(core_model, output_layer_names=[extract_features_from], return_single=True).cuda()
+        self.core_model = utils.build_classifier(classifier_G, classifier_ckpt, num_classes=num_classes).cuda()
+        self.classifier_G = ModelWrapper(self.core_model, output_layer_names=[extract_features_from], return_single=True).cuda()
 
         # make the optimizer
-        self.optimizer = optim.SGD(self.classifier_F.parameters(), lr= start_lr, momentum=0.9, weight_decay=weight_decay)
+        self.optimizer = optim.SGD(self.classifier_F.parameters(), lr=start_lr, momentum=0.9, weight_decay=weight_decay)
 
         # setup lr decay
         if lr_mode in ['step_lr_per_class']:
@@ -67,8 +69,11 @@ class REMINDModel(object):
 
         # setup parameters
         self.num_classes = num_classes
+        self.extract_features_from = extract_features_from
+        self.classifier_F_str = classifier_F
         self.lr_mode = lr_mode
         self.lr_step_size = lr_step_size
+        self.weight_decay = weight_decay
         self.start_lr = start_lr
         self.end_lr = end_lr
         self.lr_gamma = lr_gamma
@@ -83,6 +88,7 @@ class REMINDModel(object):
         self.use_random_resize_crops = use_random_resize_crops
         self.random_resize_crop = utils.RandomResizeCrop(7, scale=(2 / 7, 1.0))
         self.max_buffer_size = max_buffer_size
+        self.num_epochs = num_epochs
 
     def get_trainable_params(self, classifier, start_lr):
         trainable_params = []
@@ -90,8 +96,61 @@ class REMINDModel(object):
             trainable_params.append({'params': v, 'lr': start_lr})
         return trainable_params
 
+    def fit_base_batch(self, curr_loader, verbose=True):
+        """
+        Train classifier_G on the first task.
+        """
+        # put classifiers on GPU and set plastic portion of network to train
+        core_model = self.core_model
+        core_model.train()
+
+        base_optimizer = optim.SGD(core_model.parameters(),
+                                   lr=self.start_lr, momentum=0.9, weight_decay=self.weight_decay)
+
+        num_epochs = 50
+        base_scheduler = optim.lr_scheduler.CosineAnnealingLR(base_optimizer, num_epochs, self.end_lr)
+
+        criterion = nn.CrossEntropyLoss(reduction='none')
+
+        msg = '\rEpoch (%d/%d), Batch (%d/%d) -- train_loss=%1.6f -- elapsed_time=%d secs'
+
+        start_time = time.time()
+        for epoch_id in range(num_epochs):
+            total_loss = utils.CMA()
+            c = 0
+            for batch_images, batch_labels, batch_item_ixs in curr_loader:
+                output = core_model(batch_images.cuda())  # [bs, 40]
+                data_labels = batch_labels.long().cuda()
+
+                loss = criterion(output, data_labels)
+                loss = loss.mean()
+                base_optimizer.zero_grad()  # zero out grads before backward pass because they are accumulated
+                loss.backward()
+
+                # if gradient clipping is desired
+                if self.grad_clip is not None:
+                    nn.utils.clip_grad_norm_(core_model.parameters(), self.grad_clip)
+
+                base_optimizer.step()
+
+                total_loss.update(loss.item())
+                if verbose:
+                    print(msg % (epoch_id, num_epochs, c, len(curr_loader),
+                                 total_loss.avg, time.time() - start_time), end="")
+                c += 1
+
+            # update lr scheduler
+            base_scheduler.step()
+
+        # set up classifier_G and classifier_F
+        print(f'check load state dict for classifier_F: {[k for k, p in self.classifier_F.named_parameters()][3]}; '
+              f'core_model: {[k for k, p in self.core_model.named_parameters()][3]}.')
+        self.classifier_F.load_state_dict(self.core_model.state_dict(), strict=False)
+        self.classifier_G = ModelWrapper(self.core_model, output_layer_names=[self.extract_features_from],
+                                         return_single=True).cuda()
+
     def fit_incremental_batch(self, curr_loader, latent_dict, pq, rehearsal_ixs=None, class_id_to_item_ix_dict=None,
-                              verbose=True, counter=utils.Counter()):
+                              verbose=True, counter=utils.Counter(), fewshot=False):
         """
         Fit REMIND on samples from a data loader one at a time.
         :param curr_loader: the data loader of new samples to be fit (returns (images, labels, item_ixs)
@@ -112,153 +171,164 @@ class REMINDModel(object):
         classifier_G = self.classifier_G.cuda()
         classifier_G.eval()
 
+        # set up optimizer and scheduler
+        target = classifier_F.parameters() if not fewshot else classifier_F.model.fc.parameters()
+        optimizer = optim.SGD(target, lr=self.start_lr, momentum=0.9, weight_decay=self.weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, self.num_epochs, self.end_lr)
+
         criterion = nn.CrossEntropyLoss(reduction='none')
 
-        msg = '\rSample %d -- train_loss=%1.6f -- elapsed_time=%d secs'
+        msg = '\rEpoch (%d/%d), Sample %d -- train_loss=%1.6f -- elapsed_time=%d secs'
 
         start_time = time.time()
-        total_loss = utils.CMA()
-        c = 0
-        for batch_images, batch_labels, batch_item_ixs in curr_loader:
+        for epoch_id in range(self.num_epochs):
+            total_loss = utils.CMA()
+            c = 0
+            for batch_images, batch_labels, batch_item_ixs in curr_loader:
 
-            # get features from G and latent codes from PQ
-            data_batch = classifier_G(batch_images.cuda()).cpu().numpy()
-            data_batch = np.transpose(data_batch, (0, 2, 3, 1))
-            data_batch = np.reshape(data_batch, (-1, self.num_channels))
-            codes = pq.compute_codes(data_batch)
-            codes = np.reshape(codes, (-1, self.num_feats, self.num_feats, self.num_codebooks))
+                # get features from G and latent codes from PQ
+                data_batch = classifier_G(batch_images.cuda()).cpu().numpy()
+                data_batch = np.transpose(data_batch, (0, 2, 3, 1))
+                data_batch = np.reshape(data_batch, (-1, self.num_channels))
+                codes = pq.compute_codes(data_batch)
+                codes = np.reshape(codes, (-1, self.num_feats, self.num_feats, self.num_codebooks))
 
-            # train REMIND on one new sample at a time
-            for x, y, item_ix in zip(codes, batch_labels, batch_item_ixs):
-                if self.lr_mode == 'step_lr_per_class' and (ongoing_class is None or ongoing_class != y):
-                    ongoing_class = y
-                    self.optimizer.param_groups[0]['lr'] = self.lr_per_class[int(y)]
+                # train REMIND on one new sample at a time
+                for x, y, item_ix in zip(codes, batch_labels, batch_item_ixs):
+                    if self.lr_mode == 'step_lr_per_class' and (ongoing_class is None or ongoing_class != y):
+                        ongoing_class = y
+                        self.optimizer.param_groups[0]['lr'] = self.lr_per_class[int(y)]
 
-                if self.use_mixup:
-                    # gather two batches of previous data for mixup and replay
-                    data_codes = np.empty(
-                        (2 * self.num_samples + 1, self.num_feats, self.num_feats, self.num_codebooks),
-                        dtype=np.uint8)
-                    data_labels = torch.empty((2 * self.num_samples + 1), dtype=torch.int).cuda()
-                    data_codes[0] = x
-                    data_labels[0] = y
-                    ixs = randint(len(rehearsal_ixs), 2 * self.num_samples)
-                    ixs = [rehearsal_ixs[_curr_ix] for _curr_ix in ixs]
-                    for ii, v in enumerate(ixs):
-                        data_codes[ii + 1] = latent_dict[v][0]
-                        data_labels[ii + 1] = torch.from_numpy(latent_dict[v][1])
+                    if self.use_mixup:
+                        # gather two batches of previous data for mixup and replay
+                        data_codes = np.empty(
+                            (2 * self.num_samples + 1, self.num_feats, self.num_feats, self.num_codebooks),
+                            dtype=np.uint8)
+                        data_labels = torch.empty((2 * self.num_samples + 1), dtype=torch.int).cuda()
+                        data_codes[0] = x
+                        data_labels[0] = y
+                        ixs = randint(len(rehearsal_ixs), 2 * self.num_samples)
+                        ixs = [rehearsal_ixs[_curr_ix] for _curr_ix in ixs]
+                        for ii, v in enumerate(ixs):
+                            data_codes[ii + 1] = latent_dict[v][0]
+                            data_labels[ii + 1] = torch.from_numpy(latent_dict[v][1])
 
-                    # reconstruct/decode samples with PQ
-                    data_codes = np.reshape(data_codes, (
-                        (2 * self.num_samples + 1) * self.num_feats * self.num_feats, self.num_codebooks))
-                    data_batch_reconstructed = pq.decode(data_codes)
-                    data_batch_reconstructed = np.reshape(data_batch_reconstructed,
-                                                          (-1, self.num_feats, self.num_feats,
-                                                           self.num_channels))
-                    data_batch_reconstructed = torch.from_numpy(
-                        np.transpose(data_batch_reconstructed, (0, 3, 1, 2))).cuda()
+                        # reconstruct/decode samples with PQ
+                        data_codes = np.reshape(data_codes, (
+                            (2 * self.num_samples + 1) * self.num_feats * self.num_feats, self.num_codebooks))
+                        data_batch_reconstructed = pq.decode(data_codes)
+                        data_batch_reconstructed = np.reshape(data_batch_reconstructed,
+                                                              (-1, self.num_feats, self.num_feats,
+                                                               self.num_channels))
+                        data_batch_reconstructed = torch.from_numpy(
+                            np.transpose(data_batch_reconstructed, (0, 3, 1, 2))).cuda()
 
-                    # perform random resize crop augmentation on each tensor
-                    if self.use_random_resize_crops:
-                        transform_data_batch = torch.empty_like(data_batch_reconstructed)
-                        for tens_ix, tens in enumerate(data_batch_reconstructed):
-                            transform_data_batch[tens_ix] = self.random_resize_crop(tens)
-                        data_batch_reconstructed = transform_data_batch
+                        # perform random resize crop augmentation on each tensor
+                        if self.use_random_resize_crops:
+                            transform_data_batch = torch.empty_like(data_batch_reconstructed)
+                            for tens_ix, tens in enumerate(data_batch_reconstructed):
+                                transform_data_batch[tens_ix] = self.random_resize_crop(tens)
+                            data_batch_reconstructed = transform_data_batch
 
-                    # MIXUP: Do mixup between two batches of previous data
-                    x_prev_mixed, prev_labels_a, prev_labels_b, lam = self.mixup_data(
-                        data_batch_reconstructed[1:1 + self.num_samples],
-                        data_labels[1:1 + self.num_samples],
-                        data_batch_reconstructed[1 + self.num_samples:],
-                        data_labels[1 + self.num_samples:],
-                        alpha=self.mixup_alpha)
+                        # MIXUP: Do mixup between two batches of previous data
+                        x_prev_mixed, prev_labels_a, prev_labels_b, lam = self.mixup_data(
+                            data_batch_reconstructed[1:1 + self.num_samples],
+                            data_labels[1:1 + self.num_samples],
+                            data_batch_reconstructed[1 + self.num_samples:],
+                            data_labels[1 + self.num_samples:],
+                            alpha=self.mixup_alpha)
 
-                    data = torch.empty((self.num_samples + 1, self.num_channels, self.num_feats, self.num_feats))
-                    data[0] = data_batch_reconstructed[0]
-                    data[1:] = x_prev_mixed.clone()
-                    labels_a = torch.zeros(self.num_samples + 1).long()
-                    labels_b = torch.zeros(self.num_samples + 1).long()
-                    labels_a[0] = y.squeeze()
-                    labels_b[0] = y.squeeze()
-                    labels_a[1:] = prev_labels_a
-                    labels_b[1:] = prev_labels_b
+                        data = torch.empty((self.num_samples + 1, self.num_channels, self.num_feats, self.num_feats))
+                        data[0] = data_batch_reconstructed[0]
+                        data[1:] = x_prev_mixed.clone()
+                        labels_a = torch.zeros(self.num_samples + 1).long()
+                        labels_b = torch.zeros(self.num_samples + 1).long()
+                        labels_a[0] = y.squeeze()
+                        labels_b[0] = y.squeeze()
+                        labels_a[1:] = prev_labels_a
+                        labels_b[1:] = prev_labels_b
 
-                    # fit on replay mini-batch plus new sample
-                    output = classifier_F(data.cuda())
-                    loss = self.mixup_criterion(criterion, output, labels_a.cuda(), labels_b.cuda(), lam)
-                else:
-                    # gather previous data for replay
-                    data_codes = np.empty(
-                        (self.num_samples + 1, self.num_feats, self.num_feats, self.num_codebooks),
-                        dtype=np.uint8)
-                    data_labels = torch.empty((self.num_samples + 1), dtype=torch.long).cuda()
-                    data_codes[0] = x
-                    data_labels[0] = y
-                    ixs = randint(len(rehearsal_ixs), self.num_samples)
-                    ixs = [rehearsal_ixs[_curr_ix] for _curr_ix in ixs]
-                    for ii, v in enumerate(ixs):
-                        data_codes[ii + 1] = latent_dict[v][0]
-                        data_labels[ii + 1] = torch.from_numpy(latent_dict[v][1])
+                        # fit on replay mini-batch plus new sample
+                        output = classifier_F(data.cuda())
+                        loss = self.mixup_criterion(criterion, output, labels_a.cuda(), labels_b.cuda(), lam)
+                    else:
+                        # gather previous data for replay
+                        data_codes = np.empty(
+                            (self.num_samples + 1, self.num_feats, self.num_feats, self.num_codebooks),
+                            dtype=np.uint8)
+                        data_labels = torch.empty((self.num_samples + 1), dtype=torch.long).cuda()
+                        data_codes[0] = x
+                        data_labels[0] = y
+                        ixs = randint(len(rehearsal_ixs), self.num_samples)
+                        ixs = [rehearsal_ixs[_curr_ix] for _curr_ix in ixs]
+                        for ii, v in enumerate(ixs):
+                            data_codes[ii + 1] = latent_dict[v][0]
+                            data_labels[ii + 1] = torch.from_numpy(latent_dict[v][1])
 
-                    # reconstruct/decode samples with PQ
-                    data_codes = np.reshape(data_codes, (
-                        (self.num_samples + 1) * self.num_feats * self.num_feats, self.num_codebooks))
-                    data_batch_reconstructed = pq.decode(data_codes)
-                    data_batch_reconstructed = np.reshape(data_batch_reconstructed,
-                                                          (-1, self.num_feats, self.num_feats,
-                                                           self.num_channels))
-                    data_batch_reconstructed = torch.from_numpy(
-                        np.transpose(data_batch_reconstructed, (0, 3, 1, 2))).cuda()
+                        # reconstruct/decode samples with PQ
+                        data_codes = np.reshape(data_codes, (
+                            (self.num_samples + 1) * self.num_feats * self.num_feats, self.num_codebooks))
+                        data_batch_reconstructed = pq.decode(data_codes)
+                        data_batch_reconstructed = np.reshape(data_batch_reconstructed,
+                                                              (-1, self.num_feats, self.num_feats,
+                                                               self.num_channels))
+                        data_batch_reconstructed = torch.from_numpy(
+                            np.transpose(data_batch_reconstructed, (0, 3, 1, 2))).cuda()
 
-                    # perform random resize crop augmentation on each tensor
-                    if self.use_random_resize_crops:
-                        transform_data_batch = torch.empty_like(data_batch_reconstructed)
-                        for tens_ix, tens in enumerate(data_batch_reconstructed):
-                            transform_data_batch[tens_ix] = self.random_resize_crop(tens)
-                        data_batch_reconstructed = transform_data_batch
+                        # perform random resize crop augmentation on each tensor
+                        if self.use_random_resize_crops:
+                            transform_data_batch = torch.empty_like(data_batch_reconstructed)
+                            for tens_ix, tens in enumerate(data_batch_reconstructed):
+                                transform_data_batch[tens_ix] = self.random_resize_crop(tens)
+                            data_batch_reconstructed = transform_data_batch
 
-                    # fit on replay mini-batch plus new sample
-                    output = classifier_F(data_batch_reconstructed)
-                    loss = criterion(output, data_labels)
+                        # fit on replay mini-batch plus new sample
+                        output = classifier_F(data_batch_reconstructed)
+                        loss = criterion(output, data_labels)
 
-                loss = loss.mean()
-                self.optimizer.zero_grad()  # zero out grads before backward pass because they are accumulated
-                loss.backward()
+                    loss = loss.mean()
+                    # self.optimizer.zero_grad()  # zero out grads before backward pass because they are accumulated
+                    optimizer.zero_grad()  # zero out grads before backward pass because they are accumulated
+                    loss.backward()
 
-                # if gradient clipping is desired
-                if self.grad_clip is not None:
-                    nn.utils.clip_grad_norm_(classifier_F.parameters(), self.grad_clip)
+                    # if gradient clipping is desired
+                    if self.grad_clip is not None:
+                        nn.utils.clip_grad_norm_(classifier_F.parameters(), self.grad_clip)
 
-                self.optimizer.step()
+                    # self.optimizer.step()
+                    optimizer.step()
 
-                total_loss.update(loss.item())
-                if verbose:
-                    print(msg % (c, total_loss.avg, time.time() - start_time), end="")
-                c += 1
+                    total_loss.update(loss.item())
+                    if verbose:
+                        print(msg % (epoch_id, self.num_epochs, c, total_loss.avg, time.time() - start_time), end="")
+                    c += 1
 
-                # since we have visited item_ix, it is now eligible for replay
-                rehearsal_ixs.append(int(item_ix.numpy()))
-                latent_dict[int(item_ix.numpy())] = [x, y.numpy()]
-                class_id_to_item_ix_dict[int(y.numpy())].append(int(item_ix.numpy()))
+                    # since we have visited item_ix, it is now eligible for replay
+                    rehearsal_ixs.append(int(item_ix.numpy()))
+                    latent_dict[int(item_ix.numpy())] = [x, y.numpy()]
+                    class_id_to_item_ix_dict[int(y.numpy())].append(int(item_ix.numpy()))
 
-                # if buffer is full, randomly replace previous example from class with most samples
-                if self.max_buffer_size is not None and counter.count >= self.max_buffer_size:
-                    # class with most samples and random item_ix from it
-                    max_key = max(class_id_to_item_ix_dict, key=lambda x: len(class_id_to_item_ix_dict[x]))
-                    max_class_list = class_id_to_item_ix_dict[max_key]
-                    rand_item_ix = random.choice(max_class_list)
+                    # if buffer is full, randomly replace previous example from class with most samples
+                    if self.max_buffer_size is not None and counter.count >= self.max_buffer_size:
+                        # class with most samples and random item_ix from it
+                        max_key = max(class_id_to_item_ix_dict, key=lambda x: len(class_id_to_item_ix_dict[x]))
+                        max_class_list = class_id_to_item_ix_dict[max_key]
+                        rand_item_ix = random.choice(max_class_list)
 
-                    # remove the random_item_ix from all buffer references
-                    max_class_list.remove(rand_item_ix)
-                    latent_dict.pop(rand_item_ix)
-                    rehearsal_ixs.remove(rand_item_ix)
-                else:
-                    counter.update()
+                        # remove the random_item_ix from all buffer references
+                        max_class_list.remove(rand_item_ix)
+                        latent_dict.pop(rand_item_ix)
+                        rehearsal_ixs.remove(rand_item_ix)
+                    else:
+                        counter.update()
 
-                # update lr scheduler
-                if self.lr_scheduler_per_class is not None:
-                    self.lr_scheduler_per_class[int(y)].step()
-                    self.lr_per_class[int(y)] = self.optimizer.param_groups[0]['lr']
+                    # update lr scheduler
+                    if self.lr_scheduler_per_class is not None:
+                        self.lr_scheduler_per_class[int(y)].step()
+                        self.lr_per_class[int(y)] = self.optimizer.param_groups[0]['lr']
+
+            # update lr scheduler
+            scheduler.step()
 
     def mixup_data(self, x1, y1, x2, y2, alpha=1.0):
         if alpha > 0:
@@ -292,17 +362,26 @@ class REMINDModel(object):
                 batch_x, batch_lbls = batch[0], batch[1]
                 batch_x = batch_x.cuda()
 
+                # print(f'\nshape batch_x: {batch_x.shape}')
+
                 # get G features
                 data_batch = self.classifier_G(batch_x).cpu().numpy()
+
+                # print(f'shape data_batch: {data_batch.shape}')
 
                 # quantize test data so features are in the same space as training data
                 data_batch = np.transpose(data_batch, (0, 2, 3, 1))
                 data_batch = np.reshape(data_batch, (-1, self.num_channels))
                 codes = pq.compute_codes(data_batch)
+
+                # print(f'len codes: {len(codes)}')
+
                 data_batch_reconstructed = pq.decode(codes)
                 data_batch_reconstructed = np.reshape(data_batch_reconstructed,
                                                       (-1, self.num_feats, self.num_feats, self.num_channels))
                 data_batch_reconstructed = torch.from_numpy(np.transpose(data_batch_reconstructed, (0, 3, 1, 2))).cuda()
+
+                # print(f'shape data_batch_reconstructed: {data_batch_reconstructed.shape}')
 
                 batch_lbls = batch_lbls.cuda()
                 logits = self.classifier_F(data_batch_reconstructed)
@@ -332,6 +411,7 @@ class REMINDModel(object):
 
         state = {
             'model_state_dict': self.classifier_F.state_dict(),
+            'model_state_dict_G': self.classifier_G.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict()
         }
         print(f'\nSaving REMIND model to {save_full_path}')
@@ -357,6 +437,8 @@ class REMINDModel(object):
         print(f'\nResuming REMIND model from {resume_full_path}')
         state = torch.load(os.path.join(resume_full_path, 'remind_classifier_F_%d.pth' % inc))
         self.classifier_F.load_state_dict(state['model_state_dict'])
+        if 'model_state_dict_G' in state:
+            self.classifier_G.load_state_dict(state['model_state_dict_G'])
         self.optimizer.load_state_dict(state['optimizer_state_dict'])
 
         # load parameters
